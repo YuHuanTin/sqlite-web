@@ -1,0 +1,22 @@
+{
+  "name": "sqlite-web-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Vue frontend for sqlite-web. `npm run dev` serves these sources with HMR against a running sqlite-web; `npm run build` writes the bundle to sqlite_web/static/vue/, which is git-ignored and built for a release.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "vue-tsc --noEmit",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.43"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4",
+    "vue-tsc": "^3.3.13"
+  }
+}

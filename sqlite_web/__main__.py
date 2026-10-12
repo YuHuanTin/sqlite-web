@@ -1,4 +1,4 @@
-from sqlite_web import main
+from sqlite_web.sqlite_web import main
 
 
 if __name__ == '__main__':

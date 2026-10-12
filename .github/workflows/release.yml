@@ -1,0 +1,95 @@
+name: release
+
+# Tag a commit with a leading v and the tag gets a wheel with the built frontend
+# inside it, so installing on a device needs no Node:
+#
+#   $ git tag v0.8.3 && git push origin v0.8.3
+#
+# The leading v keeps this clear of upstream's wheels.yaml, which triggers on
+# bare version tags and publishes to PyPI.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Before the Python build, not after: MANIFEST.in collects the tree as it
+      # stands when the sdist is made, and the wheel is built from that sdist.
+      # npm install rather than npm ci, the lockfile is not tracked.
+      - name: Build the frontend
+        working-directory: frontend
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The tag is the version. Stamped into the source here so the wheel, the
+      # release and `pip show` agree without anyone remembering to bump it.
+      - name: Stamp the version from the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          version = os.environ['GITHUB_REF_NAME'].lstrip('v')
+          source = pathlib.Path('sqlite_web/sqlite_web.py')
+          with source.open(encoding='utf-8', newline='') as handle:
+              text = handle.read()
+          text, count = re.subn(r"__version__ = '[^']*'",
+                                f"__version__ = '{version}'", text, count=1)
+          assert count == 1, 'found no __version__ assignment to stamp'
+          with source.open('w', encoding='utf-8', newline='') as handle:
+              handle.write(text)
+          print(f'building version {version}')
+          PY
+
+      - name: Build the sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      # Without the frontend the wheel installs an app whose / is the old HTML
+      # UI, and the machine that installs it is the one that finds out.
+      - name: The wheel has to carry the frontend
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheel = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          carried = [name for name in names if 'static/vue/' in name]
+          assert any(name.endswith('static/vue/index.html') for name in carried), \
+              f'{wheel} carries no built frontend'
+          print(f'{wheel} carries {len(carried)} frontend files')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: dist/sqlite*
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: true

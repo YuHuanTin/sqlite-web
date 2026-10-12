@@ -1,0 +1,18 @@
+*.pyc
+*.pyo
+**/__pycache__/
+*.egg-info/
+.pytest_cache/
+uv.lock
+build/
+dist/
+
+# A build product, not source. `npm run build` regenerates it for a release and
+# `npm run dev` bypasses it entirely, serving the sources on :5173 instead. An
+# unbuilt checkout serves the original HTML app and skips the Vue tests.
+sqlite_web/static/vue/
+
+frontend/node_modules/
+frontend/.vite/
+frontend/package-lock.json
+

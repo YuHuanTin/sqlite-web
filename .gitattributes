@@ -1,0 +1,22 @@
+# CRLF everywhere on checkout, LF in the repository, so this checkout keeps
+# matching upstream and "git merge upstream/master" stays quiet.
+#
+# Files a POSIX shell or Docker has to read stay LF: a CRLF shebang line or
+# line-continuation breaks the shell, and Docker keeps the trailing CR.
+* text=auto eol=crlf
+
+run-docker text eol=lf
+*.sh text eol=lf
+docker/Dockerfile text eol=lf
+
+# Binary anyway; listed so text=auto never has to guess.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.sqlite binary
+*.db binary

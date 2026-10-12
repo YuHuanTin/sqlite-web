@@ -1,13 +1,27 @@
+import base64
+import json
 import os
+import re
 import shutil
+import socket
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+from unittest import mock
 
+from flask import Flask
 from peewee import SqliteDatabase
 from playhouse.dataset import DataSet
 
+from sqlite_web import api
 from sqlite_web import sqlite_web as sw
+from sqlite_web import vue
 from sqlite_web.executor import Result
 from sqlite_web.executor import is_read
 from sqlite_web.executor import key_decode
@@ -257,6 +271,7 @@ class BaseAppTestCase(unittest.TestCase):
         sw.datasets.clear()
         sw.initialize_app([self.db_path])
         sw.app.config['TESTING'] = True
+        sw.app.config['USE_OLD_UI'] = True
         self.client = sw.app.test_client()
 
     def tearDown(self):
@@ -981,6 +996,984 @@ class TestUrlPrefix(BaseAppTestCase):
     def test_session_cookie_scoped_to_prefix(self):
         r = self.client.get('/sqlite/users/content/')
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
+
+
+class ApiTestCase(BaseAppTestCase):
+    def get_json(self, path, **kwargs):
+        response = self.client.get(path, **kwargs)
+        return response.status_code, response.get_json()
+
+    def post_json(self, path, payload, **kwargs):
+        response = self.client.post(path, json=payload, **kwargs)
+        return response.status_code, response.get_json()
+
+    def patch_json(self, path, payload, **kwargs):
+        response = self.client.patch(path, json=payload, **kwargs)
+        return response.status_code, response.get_json()
+
+    def delete_json(self, path, **kwargs):
+        response = self.client.delete(path, **kwargs)
+        return response.status_code, response.get_json()
+
+
+class TestIndex(ApiTestCase):
+    def test_index_describes_the_api(self):
+        status, data = self.get_json('/api/')
+        self.assertEqual(status, 200)
+        self.assertIn('app.db', [os.path.basename(p) for p in data['datasets']])
+        paths = {e['path'] for e in data['endpoints']}
+        self.assertIn('/api/query/', paths)
+        self.assertIn('/api/<table>/rows/', paths)
+
+    def test_datasets_lists_the_loaded_database(self):
+        status, data = self.get_json('/api/datasets/')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data['datasets']), 1)
+        self.assertEqual(data['datasets'][0]['basename'], 'app.db')
+        self.assertFalse(data['datasets'][0]['is_readonly'])
+
+    def test_unknown_route_is_a_404(self):
+        status, _ = self.get_json('/api/nope/')
+        self.assertEqual(status, 404)
+
+
+class TestTables(ApiTestCase):
+    def test_lists_tables_and_views(self):
+        status, data = self.get_json('/api/tables/')
+        self.assertEqual(status, 200)
+        by_name = {t['name']: t for t in data['tables']}
+        self.assertIn('users', by_name)
+        self.assertIn('v_users', by_name)
+        self.assertTrue(by_name['v_users']['is_view'])
+        self.assertFalse(by_name['users']['is_view'])
+
+    def test_reports_which_tables_can_be_addressed_by_key(self):
+        _, data = self.get_json('/api/tables/')
+        by_name = {t['name']: t for t in data['tables']}
+        self.assertTrue(by_name['users']['has_usable_pk'])
+        self.assertFalse(by_name['nopk']['has_usable_pk'])
+        self.assertFalse(by_name['v_users']['has_usable_pk'])
+
+
+class TestSchema(ApiTestCase):
+    def test_columns_and_single_column_key(self):
+        status, data = self.get_json('/api/users/schema/')
+        self.assertEqual(status, 200)
+        self.assertEqual([c['column'] for c in data['columns']], ['id', 'username'])
+        self.assertEqual(data['primary_key'], {'composite': False, 'field': 'id', 'column': 'id'})
+        self.assertTrue(data['columns'][0]['primary_key'])
+        self.assertIn('CREATE TABLE', data['sql'])
+        self.assertTrue(data['has_usable_pk'])
+        self.assertFalse(data['is_view'])
+
+    def test_composite_key(self):
+        _, data = self.get_json('/api/oddpk/schema/')
+        self.assertEqual(data['primary_key'], {'composite': True, 'fields': ['user_id', 'grp']})
+
+    def test_column_name_is_reported_alongside_the_field_name(self):
+        # Reflection sanitizes "user id" into user_id, so the row endpoints and
+        # the SQL endpoint disagree unless both names are surfaced.
+        _, data = self.get_json('/api/oddpk/schema/')
+        first = data['columns'][0]
+        self.assertEqual(first['column'], 'user id')
+        self.assertEqual(first['field'], 'user_id')
+
+    def test_table_without_a_key_reports_no_primary_key(self):
+        _, data = self.get_json('/api/nopk/schema/')
+        self.assertIsNone(data['primary_key'])
+        self.assertFalse(data['has_usable_pk'])
+
+    def test_foreign_keys_are_reported(self):
+        _, data = self.get_json('/api/child/schema/')
+        self.assertEqual(len(data['foreign_keys']), 1)
+        self.assertEqual(data['foreign_keys'][0]['dest_table'], 'parent')
+
+    def test_unknown_table_is_a_404(self):
+        status, data = self.get_json('/api/nope/schema/')
+        self.assertEqual(status, 404)
+        self.assertIn('users', data['available'])
+
+
+class TestRows(ApiTestCase):
+    def test_rows_are_returned_with_keys(self):
+        status, data = self.get_json('/api/users/rows/')
+        self.assertEqual(status, 200)
+        self.assertEqual([r['username'] for r in data['rows']], ['huey', 'mickey', 'zaizee'])
+        self.assertEqual([r['id'] for r in data['rows']], [1, 2, 3])
+        for row in data['rows']:
+            self.assertIn('_key', row)
+
+    def test_columns_are_listed(self):
+        _, data = self.get_json('/api/users/rows/')
+        self.assertEqual(data['columns'], ['id', 'username'])
+
+    def test_pagination_reports_the_next_offset(self):
+        status, data = self.get_json('/api/users/rows/?limit=2')
+        self.assertTrue(data['has_next'])
+        self.assertEqual(data['next_offset'], 2)
+        self.assertEqual(len(data['rows']), 2)
+
+        status, data = self.get_json('/api/users/rows/?limit=2&offset=2')
+        self.assertFalse(data['has_next'])
+        self.assertIsNone(data['next_offset'])
+        self.assertEqual([r['username'] for r in data['rows']], ['zaizee'])
+
+    def test_limit_is_capped(self):
+        _, data = self.get_json('/api/users/rows/?limit=999999999')
+        self.assertEqual(data['limit'], api.MAX_LIMIT)
+
+    def test_filtering_by_column(self):
+        _, data = self.get_json('/api/users/rows/?username=mickey')
+        self.assertEqual([r['id'] for r in data['rows']], [2])
+
+    def test_ordering(self):
+        _, data = self.get_json('/api/users/rows/?order=-id')
+        self.assertEqual([r['id'] for r in data['rows']], [3, 2, 1])
+        _, data = self.get_json('/api/users/rows/?order=id')
+        self.assertEqual([r['id'] for r in data['rows']], [1, 2, 3])
+
+    def test_unknown_filter_column_is_rejected(self):
+        status, data = self.get_json('/api/users/rows/?nope=1')
+        self.assertEqual(status, 400)
+        self.assertIn('id', data['columns'])
+
+    def test_a_filter_value_is_a_value_not_sql(self):
+        status, data = self.get_json("/api/users/rows/?username=' OR 1=1 --")
+        self.assertEqual(status, 200)
+        self.assertEqual(data['rows'], [])
+        self.assertEqual(len(self.dbrows('SELECT * FROM users')), 3)
+
+    def test_order_is_a_column_not_sql(self):
+        status, _ = self.get_json('/api/users/rows/?order=id;DROP TABLE users--')
+        self.assertEqual(status, 400)
+        self.assertEqual(len(self.dbrows('SELECT * FROM users')), 3)
+
+    def test_undocumented_leading_underscore_params_are_ignored(self):
+        # A cache-buster must not be mistaken for a column filter.
+        status, data = self.get_json('/api/users/rows/?_=1234')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data['rows']), 3)
+
+    def test_bad_pagination_values_are_rejected(self):
+        for query in ('limit=abc', 'limit=0', 'offset=-1', 'offset=x'):
+            status, _ = self.get_json(f'/api/users/rows/?{query}')
+            self.assertEqual(status, 400, query)
+
+    def test_blob_values_are_base64(self):
+        _, data = self.get_json('/api/blobs/rows/')
+        self.assertEqual(data['rows'][0]['id'], {'b64': 'AP8='})
+
+    def test_table_without_a_key_has_no_row_keys(self):
+        _, data = self.get_json('/api/nopk/rows/')
+        self.assertEqual(data['rows'][0]['a'], 'no-pk-row')
+        self.assertNotIn('_key', data['rows'][0])
+
+    def test_view_is_readable(self):
+        status, data = self.get_json('/api/v_users/rows/')
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data['rows']), 3)
+
+
+class TestApiRowDetail(ApiTestCase):
+    def test_fetch_one_row_by_key(self):
+        _, listing = self.get_json('/api/users/rows/?username=huey')
+        key = listing['rows'][0]['_key']
+        status, data = self.get_json(f'/api/users/rows/{key}/')
+        self.assertEqual(status, 200)
+        self.assertEqual(data['row'], {'id': 1, 'username': 'huey'})
+
+    def test_key_survives_a_round_trip_through_the_url(self):
+        _, listing = self.get_json('/api/users/rows/?username=zaizee')
+        key = listing['rows'][0]['_key']
+        self.assertNotIn('/', key)
+        self.assertNotIn('+', key)
+        status, _ = self.get_json(f'/api/users/rows/{key}/')
+        self.assertEqual(status, 200)
+
+    def test_malformed_key_is_a_400(self):
+        status, _ = self.get_json('/api/users/rows/not-base64!!/')
+        self.assertEqual(status, 400)
+
+    def test_a_key_holding_a_list_is_a_400(self):
+        # Peewee reads a list as a row-value comparison, (id) = (1, 2), which is
+        # not a row: a key addresses exactly one. Hand-built, since key_encode
+        # would stringify the list.
+        for values in ([[1]], [[1, 2]]):
+            token = base64.urlsafe_b64encode(json.dumps(values).encode()).decode()
+            status, _ = self.patch_json(f'/api/users/rows/{token}/', {'username': 'nope'})
+            self.assertEqual(status, 400, values)
+            status, _ = self.delete_json(f'/api/users/rows/{token}/')
+            self.assertEqual(status, 400, values)
+        self.assertEqual(len(self.dbrows('SELECT * FROM users')), 3)
+
+    def test_a_short_composite_key_is_a_400(self):
+        # Two rows share a='US': a partial key would be an under-constrained
+        # WHERE and take both, so it has to be refused rather than shortened.
+        self.client.post('/api/comp/rows/', json={'a': 'US', 'b': 'second', 'label': 'second-row'})
+        token = sw.key_encode(['US'])
+        status, _ = self.patch_json(f'/api/comp/rows/{token}/', {'label': 'nope'})
+        self.assertEqual(status, 400)
+        status, _ = self.delete_json(f'/api/comp/rows/{token}/')
+        self.assertEqual(status, 400)
+        self.assertEqual(self.dbrows('SELECT a, b FROM comp ORDER BY b'), [('US', 'A:::B'), ('US', 'second')])
+
+    def test_well_formed_key_with_no_row_is_a_404(self):
+        status, data = self.get_json(f'/api/users/rows/{sw.key_encode([999])}/')
+        self.assertEqual(status, 404)
+        self.assertIn('error', data)
+
+    def test_composite_key_addressing(self):
+        _, listing = self.get_json('/api/oddpk/rows/')
+        keys = [r['_key'] for r in listing['rows']]
+        self.assertEqual(len(keys), 2)
+        seen = set()
+        for key in keys:
+            status, data = self.get_json(f'/api/oddpk/rows/{key}/')
+            self.assertEqual(status, 200)
+            seen.add(data['row']['val'])
+        self.assertEqual(seen, {'odd-row', 'same-grp'})
+
+    def test_blob_key_addressing(self):
+        _, listing = self.get_json('/api/blobs/rows/')
+        key = listing['rows'][0]['_key']
+        status, data = self.get_json(f'/api/blobs/rows/{key}/')
+        self.assertEqual(status, 200)
+        self.assertEqual(data['row']['note'], 'blob')
+
+
+class TestInsert(ApiTestCase):
+    def test_insert_one_row(self):
+        status, data = self.post_json('/api/users/rows/', {'username': 'new'})
+        self.assertEqual(status, 201)
+        self.assertEqual(data['inserted'], 1)
+        self.assertEqual(self.dbrows('SELECT username FROM users WHERE id = ?',
+                                     key_decode_one(data['key'])),
+                         [('new',)])
+
+    def test_insert_returns_the_new_key(self):
+        _, data = self.post_json('/api/users/rows/', {'username': 'new'})
+        status, row = self.get_json(f"/api/users/rows/{data['key']}/")
+        self.assertEqual(status, 200)
+        self.assertEqual(row['row']['username'], 'new')
+
+    def test_insert_batch(self):
+        status, data = self.post_json('/api/users/rows/', {'rows': [{'username': 'a'}, {'username': 'b'}]})
+        self.assertEqual(status, 201)
+        self.assertEqual(data['inserted'], 2)
+        self.assertEqual(self.dbrows('SELECT count(*) FROM users')[0][0], 5)
+
+    def test_insert_batch_rolls_back_entirely_on_failure(self):
+        status, data = self.post_json('/api/users/rows/', {'rows': [{'username': 'ok'}, {'nope': 'bad'}]})
+        self.assertEqual(status, 400)
+        self.assertIn('Row 1', data['error'])
+        self.assertEqual(self.dbrows('SELECT count(*) FROM users')[0][0], 3)
+
+    def test_insert_explicit_primary_key(self):
+        status, data = self.post_json('/api/users/rows/', {'id': 77, 'username': 'z'})
+        self.assertEqual(status, 201)
+        self.assertEqual(key_decode_one(data['key']), 77)
+
+    def test_insert_unknown_column_is_rejected(self):
+        status, data = self.post_json('/api/users/rows/', {'nope': 1})
+        self.assertEqual(status, 400)
+        self.assertIn('columns', data)
+
+    def test_insert_null_into_not_null_column_is_rejected(self):
+        status, data = self.post_json('/api/oddpk/rows/', {'user id': 9, 'grp': None})
+        self.assertEqual(status, 400)
+        self.assertEqual(data['column'], 'grp')
+
+    def test_insert_empty_object_is_rejected(self):
+        status, _ = self.post_json('/api/users/rows/', {})
+        self.assertEqual(status, 400)
+
+    def test_insert_into_unknown_table_is_a_404(self):
+        status, _ = self.post_json('/api/nope/rows/', {'a': 1})
+        self.assertEqual(status, 404)
+
+    def test_insert_into_a_table_without_a_key(self):
+        status, data = self.post_json('/api/nopk/rows/', {'a': 'second'})
+        self.assertEqual(status, 201)
+        self.assertEqual(data['inserted'], 1)
+        self.assertNotIn('key', data)
+
+    def test_insert_blob_via_base64(self):
+        status, _ = self.post_json('/api/nopk/rows/', {'a': 'x'})
+        self.assertEqual(status, 201)
+        _, data = self.get_json('/api/blobs/rows/')
+        self.assertEqual(data['rows'][0]['id'], {'b64': 'AP8='})
+
+
+class TestUpdate(ApiTestCase):
+    def key_for(self, username):
+        _, listing = self.get_json(f'/api/users/rows/?username={username}')
+        return listing['rows'][0]['_key']
+
+    def test_update_a_column(self):
+        status, data = self.patch_json(f"/api/users/rows/{self.key_for('huey')}/", {'username': 'huey2'})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['updated'], 1)
+        self.assertEqual(self.dbrows('SELECT username FROM users WHERE id = 1'), [('huey2',)])
+
+    def test_update_reports_zero_for_a_stale_key(self):
+        status, _ = self.patch_json(f'/api/users/rows/{sw.key_encode([999])}/', {'username': 'x'})
+        self.assertEqual(status, 404)
+
+    def test_an_object_value_is_rejected(self):
+        # str() would write Python's repr of it and call that a value.
+        status, _ = self.patch_json(f"/api/users/rows/{self.key_for('huey')}/",
+                                    {'username': {'a': 1}})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.dbrows('SELECT username FROM users WHERE id = 1'), [('huey',)])
+
+    def test_a_key_change_that_collides_changes_nothing(self):
+        # id 2 is taken: the update has to fail whole and leave both rows alone.
+        status, _ = self.patch_json(f"/api/users/rows/{self.key_for('huey')}/", {'id': 2})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.dbrows('SELECT id, username FROM users ORDER BY id'),
+                         [(1, 'huey'), (2, 'mickey'), (3, 'zaizee')])
+
+    def test_update_unknown_column_is_rejected(self):
+        status, data = self.patch_json(f"/api/users/rows/{self.key_for('huey')}/", {'nope': 1})
+        self.assertEqual(status, 400)
+        self.assertIn('columns', data)
+
+    def test_update_with_no_columns_is_rejected(self):
+        status, _ = self.patch_json(f"/api/users/rows/{self.key_for('huey')}/", {})
+        self.assertEqual(status, 400)
+
+    def test_update_at_a_table_without_a_key_is_refused(self):
+        status, data = self.patch_json(f'/api/nopk/rows/{sw.key_encode([1])}/', {'a': 'x'})
+        self.assertEqual(status, 400)
+        self.assertIn('/api/query', data['error'])
+
+    def test_update_a_composite_key_row(self):
+        _, listing = self.get_json('/api/oddpk/rows/?val=odd-row')
+        key = listing['rows'][0]['_key']
+        status, data = self.patch_json(f'/api/oddpk/rows/{key}/', {'val': 'changed'})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['updated'], 1)
+        self.assertEqual(self.dbrows('SELECT val FROM oddpk WHERE grp = ?', 'a'), [('changed',), ('same-grp',)])
+
+
+class TestDelete(ApiTestCase):
+    def test_delete_a_row(self):
+        _, listing = self.get_json('/api/users/rows/?username=zaizee')
+        key = listing['rows'][0]['_key']
+        status, data = self.delete_json(f'/api/users/rows/{key}/')
+        self.assertEqual(status, 200)
+        self.assertEqual(data['deleted'], 1)
+        self.assertEqual(self.dbrows('SELECT count(*) FROM users')[0][0], 2)
+        status, _ = self.get_json(f'/api/users/rows/{key}/')
+        self.assertEqual(status, 404)
+
+    def test_delete_at_a_table_without_a_key_is_refused(self):
+        status, _ = self.delete_json(f'/api/nopk/rows/{sw.key_encode([1])}/')
+        self.assertEqual(status, 400)
+
+    def test_delete_with_a_malformed_key_is_a_400(self):
+        status, _ = self.delete_json('/api/users/rows/!!!!/')
+        self.assertEqual(status, 400)
+
+
+class TestQuery(ApiTestCase):
+    def test_select(self):
+        status, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM users ORDER BY id'})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['kind'], 'rows')
+        self.assertEqual(data['columns'], ['id', 'username'])
+        self.assertEqual(len(data['rows']), 3)
+        self.assertEqual(data['sql'], 'SELECT * FROM users ORDER BY id')
+
+    def test_positional_parameters(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT username FROM users WHERE id = ?', 'params': [2]})
+        self.assertEqual(data['rows'], [{'username': 'mickey'}])
+
+    def test_named_parameters(self):
+        _, data = self.post_json('/api/query/',
+                                 {'sql': 'SELECT username FROM users '
+                                         'WHERE id = :id', 'params': {'id': 3}})
+        self.assertEqual(data['rows'], [{'username': 'zaizee'}])
+
+    def test_dml_reports_affected_rows(self):
+        status, data = self.post_json('/api/query/', {'sql': "UPDATE users SET username = 'x'"})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['kind'], 'affected')
+        self.assertEqual(data['affected'], 3)
+
+    def test_ddl_is_reported_as_affected(self):
+        status, data = self.post_json('/api/query/', {'sql': 'CREATE TABLE t (a TEXT)'})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['kind'], 'affected')
+
+    def test_error_is_a_400_with_the_message(self):
+        status, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM nope'})
+        self.assertEqual(status, 400)
+        self.assertIn('no such table', data['error'])
+        self.assertEqual(data['sql'], 'SELECT * FROM nope')
+
+    def test_bad_parameters_are_a_400(self):
+        status, _ = self.post_json('/api/query/', {'sql': 'SELECT ?', 'params': 'nope'})
+        self.assertEqual(status, 400)
+
+    def test_missing_sql_is_a_400(self):
+        for payload in ({}, {'sql': ''}, {'sql': '   '}):
+            status, _ = self.post_json('/api/query/', payload)
+            self.assertEqual(status, 400, payload)
+
+    def test_non_json_body_is_a_400(self):
+        status, _ = self.post_json('/api/query/', [])
+        self.assertEqual(status, 400)
+
+    def test_missing_content_type_is_a_400(self):
+        response = self.client.post('/api/query/', data='sql=SELECT 1')
+        self.assertEqual(response.status_code, 400)
+
+    def test_results_are_paginated(self):
+        status, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM users'})
+        self.assertEqual(len(data['rows']), 3)
+
+        response = self.client.post('/api/query/?limit=1', json={'sql': 'SELECT * FROM users'})
+        data = response.get_json()
+        self.assertEqual(len(data['rows']), 1)
+        self.assertTrue(data['has_next'])
+
+    def test_a_query_can_be_paged_by_offset(self):
+        # Every page request used to come back as page one, so a result longer
+        # than the limit could only ever show its first page.
+        sql = 'SELECT * FROM users ORDER BY id'
+        seen = []
+        offset = 0
+        for _ in range(5):  # more turns than there are pages, for the end check
+            response = self.client.post(f'/api/query/?limit=1&offset={offset}', json={'sql': sql})
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            seen.extend(row['id'] for row in data['rows'])
+            self.assertEqual(data['offset'], offset)
+            self.assertEqual(data['limit'], 1)
+            if data['next_offset'] is None:
+                self.assertFalse(data['has_next'])
+                break
+            self.assertEqual(data['next_offset'], offset + 1)
+            offset = data['next_offset']
+        self.assertEqual(seen, [1, 2, 3])
+
+    def test_the_last_page_reports_no_next_offset(self):
+        response = self.client.post('/api/query/?limit=2&offset=2', json={'sql': 'SELECT * FROM users ORDER BY id'})
+        data = response.get_json()
+        self.assertEqual([row['id'] for row in data['rows']], [3])
+        self.assertFalse(data['has_next'])
+        self.assertIsNone(data['next_offset'])
+
+    def test_a_full_page_that_ends_the_table_has_no_next(self):
+        # Three rows asked for, three rows there: whether a next page exists has
+        # to come from the extra row the wrapper asks for, not from the page
+        # being full, or the console offers a page that turns out to be empty.
+        response = self.client.post('/api/query/?limit=3', json={'sql': 'SELECT * FROM users'})
+        data = response.get_json()
+        self.assertEqual(len(data['rows']), 3)
+        self.assertFalse(data['has_next'])
+        self.assertIsNone(data['next_offset'])
+
+    def test_an_offset_past_the_end_is_empty_not_an_error(self):
+        response = self.client.post('/api/query/?limit=2&offset=99', json={'sql': 'SELECT * FROM users ORDER BY id'})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data['rows'], [])
+        self.assertFalse(data['has_next'])
+        self.assertEqual(data['offset'], 99)
+
+    def test_a_negative_offset_is_a_400(self):
+        response = self.client.post('/api/query/?offset=-1', json={'sql': 'SELECT * FROM users'})
+        self.assertEqual(response.status_code, 400)
+
+    def test_affected_results_carry_no_paging(self):
+        _, data = self.post_json('/api/query/', {'sql': "UPDATE users SET username = 'x'"})
+        self.assertEqual(data['kind'], 'affected')
+        self.assertNotIn('next_offset', data)
+        self.assertNotIn('offset', data)
+
+    def test_run_answers_both_page_and_offset(self):
+        # sqlite_web.py's query box counts pages, the JSON API counts rows; both
+        # spellings have to land on the same rows.
+        dataset = list(sw.datasets.values())[0]
+        sql = 'SELECT id FROM users ORDER BY id'
+        by_page = api._run(dataset, sql, page=2, page_size=1)
+        by_offset = api._run(dataset, sql, page_size=1, offset=1)
+        self.assertEqual([row[0] for row in by_page.rows], [2])
+        self.assertEqual([row[0] for row in by_offset.rows], [2])
+
+    def test_a_query_says_which_table_a_delete_would_use(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM users'})
+        self.assertEqual(data['delete_target'], 'users')
+
+    def test_a_comment_after_the_table_does_not_hide_it(self):
+        sql = 'SELECT * FROM users -- every one of them\nWHERE id > 1'
+        _, data = self.post_json('/api/query/', {'sql': sql})
+        self.assertEqual(data['delete_target'], 'users')
+
+    def test_rows_come_back_with_keys_the_row_endpoint_accepts(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM users'})
+        status, row = self.get_json(f"/api/users/rows/{data['rows'][0]['_key']}/")
+        self.assertEqual(status, 200)
+        self.assertEqual(row['row']['username'], 'huey')
+
+    def test_a_composite_key_comes_back_as_one_token(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM oddpk'})
+        status, _ = self.get_json(f"/api/oddpk/rows/{data['rows'][0]['_key']}/")
+        self.assertEqual(status, 200)
+
+    def test_a_projection_without_the_key_has_no_row_keys(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT username FROM users'})
+        self.assertEqual(data['delete_target'], 'users')
+        self.assertNotIn('_key', data['rows'][0])
+
+    def test_a_join_has_no_delete_target(self):
+        sql = 'SELECT * FROM child JOIN parent ON child.id = parent.id'
+        _, data = self.post_json('/api/query/', {'sql': sql})
+        self.assertIsNone(data['delete_target'])
+        self.assertNotIn('_key', data['rows'][0])
+
+    def test_a_table_without_a_key_has_no_delete_target(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM nopk'})
+        self.assertIsNone(data['delete_target'])
+
+    def test_a_union_has_no_delete_target(self):
+        # Rows from either side, so neither table owns them.
+        sql = 'SELECT id FROM users UNION SELECT id FROM parent'
+        _, data = self.post_json('/api/query/', {'sql': sql})
+        self.assertIsNone(data['delete_target'])
+
+    def test_a_quoted_string_does_not_hide_the_table(self):
+        sql = "SELECT 'from' AS note FROM users"
+        _, data = self.post_json('/api/query/', {'sql': sql})
+        self.assertEqual(data['delete_target'], 'users')
+
+    def test_a_subquery_does_not_hide_the_table(self):
+        sql = 'SELECT (SELECT count(*) FROM comp) AS n FROM users'
+        _, data = self.post_json('/api/query/', {'sql': sql})
+        self.assertEqual(data['delete_target'], 'users')
+
+    def test_a_qualified_table_name_is_the_table(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT * FROM main.users'})
+        self.assertEqual(data['delete_target'], 'users')
+
+    def test_an_aliased_table_has_no_delete_target(self):
+        # Conservative on purpose: two names in the FROM region are not read.
+        for sql in ('SELECT * FROM users u', 'SELECT * FROM "users" "comp"'):
+            _, data = self.post_json('/api/query/', {'sql': sql})
+            self.assertIsNone(data['delete_target'], sql)
+
+    def test_blobs_come_back_base64_encoded(self):
+        _, data = self.post_json('/api/query/', {'sql': 'SELECT id FROM blobs'})
+        self.assertEqual(data['rows'][0]['id'], {'b64': 'AP8='})
+
+    def test_bound_parameters_with_pagination(self):
+        _, data = self.post_json('/api/query/?limit=1', {'sql': 'SELECT * FROM users WHERE id > ?', 'params': [0]})
+        self.assertEqual(len(data['rows']), 1)
+        self.assertTrue(data['has_next'])
+
+
+class TestScript(ApiTestCase):
+    def test_runs_each_statement(self):
+        status, data = self.post_json(
+            '/api/script/',
+            {'sql': "INSERT INTO users (username) VALUES ('new');"
+                    ' SELECT count(*) AS n FROM users;'})
+        self.assertEqual(status, 200)
+        self.assertFalse(data['failed'])
+        self.assertEqual(data['total_statements'], 2)
+        self.assertEqual(data['results'][0]['kind'], 'affected')
+        self.assertEqual(data['results'][1]['rows'], [{'n': 4}])
+
+    def test_stops_at_the_first_error(self):
+        status, data = self.post_json('/api/script/', {'sql': 'SELECT * FROM nope; SELECT 1;'})
+        self.assertEqual(status, 200)
+        self.assertTrue(data['failed'])
+        self.assertEqual(len(data['results']), 1)
+        self.assertEqual(data['results'][0]['kind'], 'error')
+        self.assertIn('no such table', data['results'][0]['error'])
+
+    def test_empty_script_is_a_400(self):
+        status, _ = self.post_json('/api/script/', {'sql': '   '})
+        self.assertEqual(status, 400)
+
+
+class TestDatasetSelection(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.other_path = os.path.join(self.tmp, 'other.db')
+        conn = sqlite3.connect(self.other_path)
+        conn.executescript('CREATE TABLE thing (id INTEGER PRIMARY KEY);' "INSERT INTO thing VALUES (5);")
+        conn.commit()
+        conn.close()
+        sw.initialize_app([self.other_path])
+
+    def test_both_databases_are_listed(self):
+        _, data = self.get_json('/api/datasets/')
+        self.assertEqual(len(data['datasets']), 2)
+
+    def test_default_dataset_is_the_session_one(self):
+        # No cookie and no ?dataset=, so get_dataset falls back to the first
+        # loaded database -- app.db.
+        status, tables = self.get_json('/api/tables/')
+        self.assertEqual(status, 200)
+        names = {t['name'] for t in tables['tables']}
+        self.assertIn('users', names)
+        self.assertNotIn('thing', names)
+
+    def test_select_by_full_path(self):
+        status, data = self.get_json(f'/api/tables/?dataset={self.other_path}')
+        self.assertEqual(status, 200)
+        self.assertEqual([t['name'] for t in data['tables']], ['thing'])
+
+    def test_select_by_basename(self):
+        for name in ('other.db', 'other'):
+            status, data = self.get_json(f'/api/tables/?dataset={name}')
+            self.assertEqual(status, 200, name)
+            self.assertEqual([t['name'] for t in data['tables']], ['thing'])
+
+    def test_select_by_header(self):
+        response = self.client.get('/api/tables/', headers={'X-Dataset': 'other.db'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([t['name'] for t in response.get_json()['tables']], ['thing'])
+
+    def test_query_runs_against_the_selected_dataset(self):
+        status, data = self.post_json('/api/query/?dataset=other.db', {'sql': 'SELECT * FROM thing'})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['rows'][0]['id'], 5)
+
+    def test_unknown_dataset_is_a_404(self):
+        status, data = self.get_json('/api/tables/?dataset=nope')
+        self.assertEqual(status, 404)
+        self.assertEqual(len(data['available']), 2)
+
+    def test_every_path_the_api_reports_is_usable_as_a_selector(self):
+        # Including the 8.3 short form tempfile.mkdtemp produces on Windows.
+        _, data = self.get_json('/api/datasets/')
+        for entry in data['datasets']:
+            for name in (entry['key'], entry['basename']):
+                status, _ = self.get_json(f'/api/tables/?dataset={name}')
+                self.assertEqual(status, 200, name)
+
+
+class TestApiReadOnly(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path], read_only=True)
+        sw.app.config['TESTING'] = True
+        self.client = sw.app.test_client()
+
+    def test_reads_still_work(self):
+        status, data = self.get_json('/api/users/rows/')
+        self.assertEqual(status, 200)
+        self.assertTrue(data['is_readonly'])
+
+    def test_writes_are_refused(self):
+        status, data = self.post_json('/api/users/rows/', {'username': 'x'})
+        self.assertEqual(status, 403)
+        self.assertIn('read-only', data['error'])
+
+        status, _ = self.post_json('/api/query/', {'sql': "DELETE FROM users"})
+        self.assertEqual(status, 403)
+
+    def test_scripts_that_write_are_refused(self):
+        status, data = self.post_json('/api/script/', {'sql': 'DELETE FROM users'})
+        self.assertEqual(status, 403)
+        self.assertIn('read-only', data['error'])
+
+    def test_queries_still_work(self):
+        status, data = self.post_json('/api/query/', {'sql': 'SELECT count(*) AS n FROM users'})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['rows'], [{'n': 3}])
+
+
+class TestCrossSitePolicy(ApiTestCase):
+    def test_cross_site_post_is_refused(self):
+        # Inherited from the HTML app: a browser labels a cross-site form post
+        # this way, and the API must not be a way around that.
+        response = self.client.post('/api/query/', json={'sql': 'SELECT 1'}, headers={'Sec-Fetch-Site': 'cross-site'})
+        self.assertEqual(response.status_code, 403)
+
+    def test_a_client_that_omits_the_header_is_allowed(self):
+        status, _ = self.post_json('/api/query/', {'sql': 'SELECT 1'})
+        self.assertEqual(status, 200)
+
+
+class TestRegistration(unittest.TestCase):
+    def test_disabled_means_no_blueprint(self):
+        app = Flask(__name__)
+        api.register(app, enabled=False)
+        self.assertNotIn('api', app.blueprints)
+
+    def test_enabled_registers_once(self):
+        app = Flask(__name__)
+        api.register(app, enabled=True)
+        self.assertIn('api', app.blueprints)
+        before = {r.rule for r in app.url_map.iter_rules()}
+        api.register(app, enabled=True)
+        self.assertEqual({r.rule for r in app.url_map.iter_rules()}, before)
+
+    def test_does_not_register_a_static_route(self):
+        # A rule on /static/ from this blueprint would shadow the HTML app's.
+        app = Flask(__name__)
+        api.register(app)
+        self.assertNotIn('api.static', app.view_functions)
+
+    def test_default_is_enabled(self):
+        app = Flask(__name__)
+        api.register(app)
+        self.assertIn('api', app.blueprints)
+
+
+class TestPasswordAuth(BaseAppTestCase):
+    """-P must protect the JSON API without breaking the Vue shell.
+
+    The app is a module-level singleton and install_auth_handler appends a
+    before_request hook to it, so the hook table is snapshotted and restored in
+    tearDown -- otherwise the hook would follow every later test around.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._hooks = {k: list(v) for k, v in sw.app.before_request_funcs.items()}
+        self.addCleanup(self._restore_hooks)
+        # Flask refuses to add a before_request hook once the app has served a
+        # request, and every earlier test here has. In production
+        # install_auth_handler runs from initialize_app, before serving.
+        sw.app._got_first_request = False
+        sw.install_auth_handler('secret')
+        self.client = sw.app.test_client()
+
+    def _restore_hooks(self):
+        sw.app.before_request_funcs.clear()
+        sw.app.before_request_funcs.update(self._hooks)
+        sw.app.config.pop('PASSWORD', None)
+
+    def test_api_answers_401_instead_of_redirecting(self):
+        response = self.client.get('/api/tables/')
+        self.assertEqual(response.status_code, 401)
+        self.assertIn('error', response.get_json())
+
+    def test_writes_are_gated_too(self):
+        response = self.client.post('/api/users/rows/', json={'username': 'x'})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users')[0][0], 3)
+
+    def test_shell_redirects_to_the_login_form(self):
+        response = self.client.get('/app/')
+        self.assertEqual(response.status_code, 302)
+        self.assertIn('/login/', response.headers['Location'])
+
+    def test_assets_are_served_without_a_session(self):
+        # The shell cannot render without them, and the login page has none of
+        # the names it asks for.
+        shell = self.client.get('/login/').status_code
+        self.assertEqual(shell, 200)
+        response = self.client.get('/app/assets/nope.js')
+        self.assertEqual(response.status_code, 404)
+
+    def test_logging_in_opens_the_api(self):
+        self.assertEqual(self.client.get('/api/tables/').status_code, 401)
+        self.client.post('/login/', data={'password': 'secret'})
+        self.assertEqual(self.client.get('/api/tables/').status_code, 200)
+
+    def test_wrong_password_leaves_it_shut(self):
+        self.client.post('/login/', data={'password': 'nope'})
+        self.assertEqual(self.client.get('/api/tables/').status_code, 401)
+
+
+class TestVueApp(unittest.TestCase):
+    """The shell's asset URLs have to stay relative, and the assets have to be
+    served from under /app/ so -u/--url-prefix moves them along with it."""
+
+    def setUp(self):
+        if not vue.is_built():
+            self.skipTest('frontend has not been built (cd frontend && npm run build)')
+        self.app = Flask(__name__)
+        vue.register(self.app)
+        self.client = self.app.test_client()
+
+    def test_disabled_means_no_blueprint(self):
+        app = Flask(__name__)
+        vue.register(app, enabled=False)
+        self.assertNotIn('vue', app.blueprints)
+
+    def test_enabled_registers_once(self):
+        self.assertIn('vue', self.app.blueprints)
+        before = {r.rule for r in self.app.url_map.iter_rules()}
+        vue.register(self.app, enabled=True)
+        self.assertEqual({r.rule for r in self.app.url_map.iter_rules()}, before)
+
+    def test_does_not_register_a_static_route(self):
+        # The HTML app owns /static/; a rule on that path would shadow it and
+        # break the old frontend's assets.
+        self.assertNotIn('vue.static', self.app.view_functions)
+        self.assertFalse(vue.bp.has_static_folder)
+
+    def test_shell_is_served(self):
+        response = self.client.get('/app/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('assets/index-', response.get_data(as_text=True))
+
+    def test_assets_are_relative_and_resolve(self):
+        # Vite's base: './' is what makes -u/--url-prefix survivable; an
+        # absolute /static/vue/... would silently break it.
+        shell = self.client.get('/app/').get_data(as_text=True)
+        assets = re.findall(r'(?:src|href)="(\./assets/[^"]+)"', shell)
+        self.assertGreaterEqual(len(assets), 2, shell)
+        for rel in assets:
+            response = self.client.get('/app/' + rel[2:])
+            self.assertEqual(response.status_code, 200, rel)
+            self.assertGreater(len(response.get_data()), 500, rel)
+
+    def test_unknown_asset_is_a_404(self):
+        self.assertEqual(self.client.get('/app/assets/nope.js').status_code, 404)
+
+    def test_unbuilt_checkout_does_not_mount_the_routes(self):
+        with tempfile.TemporaryDirectory() as empty:
+            with mock.patch.object(vue, 'BUILT_DIR', empty):
+                app = Flask(__name__)
+                vue.register(app)
+        self.assertNotIn('vue', app.blueprints)
+
+
+class TestVueOnTheRealApp(BaseAppTestCase):
+    def setUp(self):
+        super().setUp()
+        if not vue.is_built():
+            self.skipTest('frontend has not been built (cd frontend && npm run build)')
+
+    def test_app_is_mounted(self):
+        response = self.client.get('/app/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('assets/index-', response.get_data(as_text=True))
+
+    def test_api_is_mounted(self):
+        self.assertEqual(self.client.get('/api/tables/').status_code, 200)
+
+    def test_root_serves_the_vue_app_by_default(self):
+        # BaseAppTestCase pins USE_OLD_UI so tests.py can keep testing the
+        # original index; the dev branch's default is the other way round.
+        sw.app.config.pop('USE_OLD_UI', None)
+        self.addCleanup(sw.app.config.__setitem__, 'USE_OLD_UI', True)
+        response = self.client.get('/')
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers['Location'].endswith('/app/'), response.headers['Location'])
+
+    def test_use_old_ui_puts_the_original_index_back(self):
+        sw.app.config['USE_OLD_UI'] = True
+        self.assertEqual(self.client.get('/').status_code, 200)
+        self.assertEqual(self.client.get('/users/').status_code, 200)
+        self.assertEqual(self.client.get('/app/').status_code, 200)
+
+
+class TestCliFlag(unittest.TestCase):
+    def test_the_vue_app_is_the_default(self):
+        options, _ = sw.get_option_parser().parse_args(['some.db'])
+        self.assertFalse(options.use_old_ui)
+
+    def test_use_old_ui(self):
+        options, _ = sw.get_option_parser().parse_args(['--use-old-ui', 'some.db'])
+        self.assertTrue(options.use_old_ui)
+        options, _ = sw.get_option_parser().parse_args(['-O', 'some.db'])
+        self.assertTrue(options.use_old_ui)
+
+    def test_the_removed_flags_are_gone(self):
+        # --no-api and --old-ui were folded into --use-old-ui. optparse has to
+        # reject them: accepting one and quietly doing nothing would be worse
+        # than an error for a flag that used to switch off a whole API.
+        for flag in ('-A', '--no-api', '--old-ui'):
+            with mock.patch('sys.stderr'):
+                with self.assertRaises(SystemExit, msg=flag):
+                    sw.get_option_parser().parse_args([flag, 'some.db'])
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+def _kill(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+class TestRunAsMain(unittest.TestCase):
+    """
+    ``python -m sqlite_web`` has to serve the same app as the console script.
+
+    That is what __main__.py exists for, and it fails quietly when __main__.py
+    imports the package rather than the module defining main(): __init__.py is
+    empty, most of the JSON API stays healthy, and only the endpoints that
+    enumerate the datasets registry go empty -- the Vue app renders blank while
+    /api/tables/ and every row endpoint answer perfectly.
+
+    A subprocess is the only honest way to test it. In-process the module is
+    imported under the name the app was built from, which is exactly the
+    condition under which the bug cannot occur.
+    """
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.db = os.path.join(tmp, 'app.db')
+        conn = sqlite3.connect(self.db)
+        conn.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)')
+        conn.execute("INSERT INTO t (name) VALUES ('hello')")
+        conn.commit()
+        conn.close()
+        self.port = _free_port()
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(sw.__file__)))
+
+    def url(self, path):
+        return f'http://127.0.0.1:{self.port}{path}'
+
+    def start(self):
+        log = tempfile.TemporaryFile()
+        self.addCleanup(log.close)
+        proc = subprocess.Popen(
+            [sys.executable, '-m', 'sqlite_web', '-x', '-p', str(self.port), self.db],
+            cwd=self.root, stdout=log, stderr=subprocess.STDOUT)
+        self.addCleanup(_kill, proc)
+        for _ in range(160):
+            if proc.poll() is not None:
+                log.seek(0)
+                output = log.read().decode('utf-8', 'replace')[:800]
+                self.fail(f'server exited: {output}')
+            try:
+                urllib.request.urlopen(self.url('/api/datasets/'), timeout=2).read()
+                return
+            except urllib.error.HTTPError:
+                return
+            except Exception:
+                time.sleep(0.25)
+        self.fail(f'server never came up on port {self.port}')
+
+    def fetch(self, path):
+        with urllib.request.urlopen(self.url(path), timeout=10) as fh:
+            return json.loads(fh.read())
+
+    def test_the_registry_is_not_empty(self):
+        self.start()
+        payload = self.fetch('/api/datasets/')
+        self.assertEqual(len(payload['datasets']), 1, payload)
+
+    def test_a_dataset_can_be_addressed_by_name(self):
+        # The app addresses a database by name on every request after the
+        # first, through the registry rather than through the HTML session.
+        self.start()
+        key = self.fetch('/api/datasets/')['datasets'][0]['key']
+        tables = self.fetch('/api/tables/?dataset=' + urllib.parse.quote(key))
+        self.assertEqual([t['name'] for t in tables['tables']], ['t'])
+
+def key_decode_one(token):
+    return key_decode(token)[0]
 
 
 if __name__ == '__main__':

@@ -1,0 +1,619 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #f0f2f5;
+  --border: #d8dce2;
+  --text: #1c1f23;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --danger: #dc2626;
+  --ok: #059669;
+  --warn: #b45309;
+  --radius: 6px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #16181d;
+    --panel: #1e2128;
+    --panel-2: #262a33;
+    --border: #363b45;
+    --text: #e6e8eb;
+    --muted: #9aa1ad;
+    --accent: #4f86f7;
+    --danger: #f87171;
+    --ok: #34d399;
+    --warn: #fbbf24;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #16181d;
+  --panel: #1e2128;
+  --panel-2: #262a33;
+  --border: #363b45;
+  --text: #e6e8eb;
+  --muted: #9aa1ad;
+  --accent: #4f86f7;
+  --danger: #f87171;
+  --ok: #34d399;
+  --warn: #fbbf24;
+}
+
+* { box-sizing: border-box; }
+
+/* The pseudo-elements are the only way to set how thin a bar is: the standard
+   properties leave the width to the browser, and setting them in Chromium
+   switches it back to its own bar and ignores everything here. */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+::-webkit-scrollbar-corner { background: transparent; }
+
+.tabstrip::-webkit-scrollbar { height: 5px; }
+.tabstrip::-webkit-scrollbar-thumb { background: var(--muted); }
+
+/* Behind a guard: in a browser that has the pseudo-elements above, these would
+   undo them. */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+}
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+
+a { color: var(--accent); }
+
+.layout { display: flex; height: 100%; }
+
+.sidebar {
+  width: 260px;
+  flex: none;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sidebar-head {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.sidebar-scroll { overflow-y: auto; flex: 1; padding: 8px; }
+
+.sidebar-rail {
+  flex: none;
+  width: 26px;
+  padding: 0;
+  background: var(--panel);
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--muted);
+  cursor: pointer;
+}
+.sidebar-rail:hover { background: var(--panel-2); color: var(--text); }
+
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+.tabstrip {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 7px 10px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 9px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tab-item:hover { background: var(--panel); color: var(--text); }
+.tab-item.active {
+  background: var(--panel);
+  border-color: var(--border);
+  color: var(--text);
+}
+.tab-item.view .tab-name { font-style: italic; }
+
+.tab-name { overflow: hidden; text-overflow: ellipsis; }
+.tab-x {
+  padding: 0 3px;
+  border-radius: 3px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--muted);
+}
+.tab-x:hover { background: var(--panel-2); color: var(--danger); }
+.tab-none { padding: 4px; font-size: 12px; color: var(--muted); }
+
+.menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 150px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.menu button {
+  display: block;
+  width: 100%;
+  padding: 5px 9px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.menu button:hover { background: var(--panel-2); }
+.menu button.danger { color: var(--danger); }
+.menu hr { margin: 4px 2px; border: none; border-top: 1px solid var(--border); }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+  flex-wrap: wrap;
+}
+
+.content { flex: 1; overflow: auto; padding: 14px; }
+
+.content.fill {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+.pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+.rows-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.rows-view .grid-wrap { flex: 1; min-height: 0; }
+
+.rows-view > .topbar { padding: 10px 14px; background: none; border: none; }
+.rows-view > .error { margin: 12px 14px 0; }
+.content.fill > .error,
+.content.fill > .notice { margin: 12px 14px 10px; }
+.rows-view .grid-wrap { border-left: none; border-right: none; border-radius: 0; }
+
+.btn {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn.danger { color: var(--danger); }
+/* Filled rather than outlined: the one action here that cannot be undone. */
+.btn.danger-solid {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.btn.danger-solid:hover:not(:disabled) { border-color: var(--danger); }
+.btn.sm { padding: 2px 7px; font-size: 12px; }
+
+.input, .select {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  min-width: 0;
+}
+
+.input:focus, .select:focus, textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* No width here: a blanket `width: 100%` would also land on the two panes of a
+   BLOB's editor and undo the widths they are given further down. */
+textarea.input { font-family: var(--mono); resize: vertical; }
+
+.tabs { display: flex; gap: 2px; }
+
+.tab {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 5px 12px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+
+.badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.badge.ro { color: var(--warn); border-color: var(--warn); }
+.badge.view { color: var(--accent); border-color: var(--accent); }
+
+.spacer { flex: 1; }
+
+.table-list { list-style: none; margin: 0; padding: 0; }
+
+.table-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  overflow: hidden;
+}
+.table-list li:hover { background: var(--panel-2); }
+/* A tint only: a saturated fill here forces the badges to inherit its colour and
+   "view" and "no pk" disappear against their own background. */
+.table-list li.active {
+  background: color-mix(in srgb, var(--accent) 16%, var(--panel));
+  color: var(--text);
+}
+.table-list .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.table-list .count {
+  margin-left: auto;
+  padding-left: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.section-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  padding: 10px 8px 4px;
+}
+
+.section-label .count { margin-left: auto; }
+
+.grid-wrap { overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+
+table.grid { border-collapse: collapse; width: 100%; font-size: 13px; }
+
+table.grid th, table.grid td {
+  border-bottom: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Scoped to the two grids that pick: the Structure cards are ordinary tables
+   whose text has to stay selectable, and copying out of them is most of what
+   they are for. */
+.rows-view table.grid td,
+.result-grid table.grid td { cursor: cell; user-select: none; }
+.rows-view table.grid td.picked,
+.result-grid table.grid td.picked {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--panel-2);
+}
+
+table.grid thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  z-index: 1;
+  white-space: nowrap;
+}
+.rows-view table.grid thead th { cursor: pointer; user-select: none; }
+table.grid thead th.nosort { cursor: default; }
+table.grid tbody tr:hover { background: var(--panel-2); }
+table.grid td.mono { font-family: var(--mono); font-size: 12px; }
+table.grid td.null { color: var(--muted); font-style: italic; }
+table.grid .pk { font-weight: 600; }
+
+/* The two grids that virtualize draw only the rows on screen: the height of a
+   row has to be the number virtual.ts counts with, the widths come from the
+   colgroup rather than from the cells that happen to be drawn, and the spacer
+   rows that stand in for the rest are invisible. */
+table.grid.fixed { table-layout: fixed; }
+table.grid.fixed tbody td { height: 28px; line-height: 20px; }
+table.grid.fixed tbody tr.spacer td { padding: 0; border: none; }
+table.grid.fixed tbody tr.spacer:hover { background: none; }
+
+/* A long result scrolls in place instead of pushing the page down: the header
+   stays put, and the grid above it stays reachable. */
+.result-grid .grid-wrap { max-height: 70vh; }
+
+.sort-mark { color: var(--accent); }
+
+/* Drawn whether or not anything is picked, so that picking a cell does not shift
+   the grid down under the pointer doing the picking. */
+.pick-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 16px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.filter-row th { padding: 3px 6px; }
+.filter-row input {
+  width: 100%;
+  font-size: 12px;
+  padding: 2px 5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.error {
+  background: color-mix(in srgb, var(--danger) 12%, var(--panel));
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.notice {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+.empty { color: var(--muted); padding: 20px; text-align: center; }
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 50;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 100%;
+  max-width: 560px;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-head, .modal-foot {
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.modal-head { border-bottom: 1px solid var(--border); font-weight: 600; }
+.modal-foot { border-top: 1px solid var(--border); justify-content: flex-end; }
+.modal-body { padding: 14px; overflow: auto; }
+
+.field { margin-bottom: 10px; }
+.field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+/* The field's own child, not everything under it: a BLOB's editor is two boxes
+   laid out inside a field, and they carry their own widths. */
+.field > .input { width: 100%; }
+.field .meta { font-size: 11px; color: var(--muted); }
+
+.cell-text { min-height: 160px; }
+
+.cell-view {
+  margin: 0;
+  padding: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.modal.wide {
+  width: auto;
+  max-width: min(920px, calc(100vw - 40px));
+}
+
+.hex-edit { display: flex; gap: 10px; align-items: stretch; }
+
+/* Both sides share a line box: same font, size, line-height, padding and border,
+   which is what keeps the text column on the same line as the bytes that
+   produced it. */
+textarea.hex-text,
+.hex-ascii {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 5px 8px;
+  white-space: pre;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* Sixteen bytes a line is 48 characters on the left and 16 on the right. The
+   28px is the padding, the borders, and the slack a vertical scrollbar needs:
+   without it a long BLOB scrolls sideways as well. */
+textarea.hex-text {
+  flex: 0 1 auto;
+  width: calc(48ch + 28px);
+  min-width: 0;
+  min-height: 220px;
+  resize: vertical;
+  background: var(--panel);
+}
+
+.hex-ascii {
+  flex: 0 0 auto;
+  width: calc(16ch + 28px);
+  margin: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  overflow: hidden;
+}
+
+.schema-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.card h3 {
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+}
+.card pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.console-split { display: flex; gap: 10px; align-items: stretch; }
+
+.console-sql { flex: 1; min-width: 0; min-height: 180px; }
+
+.pager { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
+.pager span { color: var(--muted); font-size: 12px; }
+
+.history {
+  flex: none;
+  width: 30vw;
+  height: 360px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+}
+
+.link {
+  margin-left: auto;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.history ul { flex: 1; margin: 0; padding: 0; list-style: none; overflow-y: auto; }
+
+.history li {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history li:hover { background: var(--panel-2); }
+.history li.empty {
+  font-family: inherit;
+  color: var(--muted);
+  border-bottom: none;
+  cursor: default;
+}
+.history li.empty:hover { background: none; }
+
+@media (max-width: 720px) {
+  .layout { flex-direction: column; }
+  .sidebar { width: 100%; max-height: 40%; border-right: none; border-bottom: 1px solid var(--border); }
+  .console-split { flex-direction: column; }
+  .history { width: 100%; height: auto; max-height: 160px; }
+}

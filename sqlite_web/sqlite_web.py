@@ -367,6 +367,8 @@ def _bulk_delete_values(tokens):
 
 @app.route('/')
 def index():
+    if not app.config.get('USE_OLD_UI') and vue.is_mounted(app):
+        return redirect(url_for('vue.serve'))
     return render_template('index.html', sqlite=sqlite3)
 
 @app.route('/login/', methods=['GET', 'POST'])
@@ -1520,6 +1522,11 @@ def encode_pk(row, pk):
 def decode_pk(model, token):
     pk = model._meta.primary_key
     values = key_decode(token)
+    for value in values:
+        # A list or object becomes a row-value comparison, which is not a row: a
+        # key is a list of scalars, one per primary key column.
+        if value is not None and not isinstance(value, (str, int, float, bytes)):
+            raise ValueError('row key holds a non-scalar value')
     if isinstance(pk, CompositeKey):
         fields = [pk.model._meta.fields[f] for f in pk.field_names]
         if len(values) != len(fields):
@@ -1825,6 +1832,14 @@ def get_option_parser():
         dest='enable_filesystem',
         help=('Enable loading additional databases by specifying on-disk '
               'path at runtime.'))
+    parser.add_option(
+        '-O',
+        '--use-old-ui',
+        action='store_true',
+        default=False,
+        dest='use_old_ui',
+        help=('Serve the original HTML interface at / and leave the JSON API '
+              'off. The default is the Vue app at /, backed by the JSON API.'))
     ssl_opts = optparse.OptionGroup(parser, 'SSL options')
     ssl_opts.add_option(
         '-c',
@@ -1866,8 +1881,13 @@ def install_auth_handler(password):
 
     @app.before_request
     def check_password():
+        # /app/assets/ is exempt like /static/: without it the login page would
+        # be served in place of the Vue shell's own JS and CSS.
         if not session.get('authorized') and request.path != '/login/' and \
-           not request.path.startswith(('/static/', '/favicon')):
+           not request.path.startswith(('/static/', '/favicon', '/app/assets/')):
+            if request.path.startswith('/api/'):
+                # A JSON client can make no sense of a redirect to an HTML form.
+                return jsonify({'error': 'Authentication required.'}), 401
             flash('You must log-in to view the database browser.', 'danger')
             session['next_url'] = request.base_url
             return redirect(url_for('login'))
@@ -1930,6 +1950,10 @@ def initialize_app(filenames, read_only=False, password=None, url_prefix=None,
         dataset = initialize_dataset(filename)
         datasets[dataset.filename] = dataset
 
+    enable_api = not app.config.get('USE_OLD_UI', False)
+    api.register(app, enable_api)
+    vue.register(app, enable_api)
+
 def configure_app():
     # This function exists to act as a console script entry-point.
     parser = get_option_parser()
@@ -1977,6 +2001,7 @@ def configure_app():
     # Store reference to these config options.
     app.config['ENABLE_LOAD'] = options.enable_load
     app.config['ENABLE_FILESYSTEM'] = options.enable_filesystem
+    app.config['USE_OLD_UI'] = options.use_old_ui
     app.config['DB_UPLOAD_DIR'] = options.upload_dir
 
     if options.startup_hook:
@@ -1998,6 +2023,11 @@ def configure_app():
 
     if options.upload_dir and not options.enable_load:
         app.logger.warning('--upload-dir has no effect without --enable-load.')
+    if not options.use_old_ui and not vue.is_mounted(app) and not options.debug:
+        app.logger.warning(
+            'Frontend has not been built, serving the original UI. Run the dev '
+            'server with "uv run setup.py dev", or build it with '
+            '"cd frontend && npm run build".')
 
     if options.browser:
         scheme = 'https' if (options.ssl_ad_hoc or options.ssl_cert) else 'http'
@@ -2034,6 +2064,11 @@ def main():
 
     # Run WSGI application.
     app.run(**kwargs)
+
+
+# Last, deliberately: both import this module back, so moving this to the top
+# of the file breaks the import cycle.
+from sqlite_web import api, vue
 
 
 if __name__ == '__main__':
